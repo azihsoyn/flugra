@@ -18,7 +18,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Plan { root, database_url } => cli::plan(&root, &database_url).await,
-        Command::Apply { root, database_url } => cli::apply(&root, &database_url).await,
+        Command::Apply { root, database_url, yes } => cli::apply(&root, &database_url, yes).await,
         Command::Import {
             root,
             database_url,

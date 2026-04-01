@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-use crate::{discovery, executor, hooks, ledger, planner, schema};
+use crate::{discovery, executor, hooks, ledger, parser, planner, schema};
 
 #[derive(Parser)]
 #[command(name = "flugra", about = "fluent migration — dependency-aware execution manager for native SQL units")]
@@ -33,6 +33,10 @@ pub enum Command {
         /// Database connection URL
         #[arg(long, env = "DATABASE_URL")]
         database_url: String,
+
+        /// Skip confirmation prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 
     /// Import existing migration state into the ledger
@@ -116,20 +120,38 @@ pub async fn plan(root: &PathBuf, database_url: &str) -> Result<()> {
     println!("Pending {} unit(s) (of {} total):\n", pending.len(), order.len());
     for (i, unit_id) in pending.iter().enumerate() {
         let dep = &deps[*unit_id];
+        let unit = &units[*unit_id];
         let checksum = &checksums[*unit_id];
-        print!("  {}. {} ({}...)", i + 1, unit_id, &checksum[..8.min(checksum.len())]);
+        let sql = unit.read_sql()?;
+
+        // Header
+        println!("  {}. {} ({}...)", i + 1, unit_id, &checksum[..8.min(checksum.len())]);
+
+        // Dependencies
         if !dep.depends_on_units.is_empty() {
-            print!(" depends on: {}", dep.depends_on_units.join(", "));
+            println!("     depends on: {}", dep.depends_on_units.join(", "));
         }
+
+        // SQL operations summary
+        let ops = summarize_sql_operations(&sql);
+        if !ops.is_empty() {
+            println!("     operations: {}", ops);
+        }
+
+        // Transaction mode
+        if executor::needs_statement_mode(&sql) {
+            println!("     transaction: per-statement (ALTER TYPE ADD VALUE detected)");
+        }
+
         println!();
     }
 
-    println!("\nAlready applied: {} unit(s)", applied.len());
+    println!("Already applied: {} unit(s)", applied.len());
 
     Ok(())
 }
 
-pub async fn apply(root: &PathBuf, database_url: &str) -> Result<()> {
+pub async fn apply(root: &PathBuf, database_url: &str, yes: bool) -> Result<()> {
     let hooks_config = hooks::HooksConfig::load(root)?;
     if hooks_config.has_hooks() {
         println!("Loaded hooks from flugra.hooks.yaml");
@@ -155,6 +177,50 @@ pub async fn apply(root: &PathBuf, database_url: &str) -> Result<()> {
         .connect(database_url)
         .await
         .context("Failed to connect to database")?;
+
+    ledger::ensure_table(&pool).await?;
+    let applied = ledger::applied_units(&pool).await?;
+
+    let pending: Vec<&String> = order.iter().filter(|id| !applied.contains(*id)).collect();
+
+    if pending.is_empty() {
+        println!("Nothing to apply. All {} unit(s) are already applied.", order.len());
+        return Ok(());
+    }
+
+    // Show pending units
+    println!("Will apply {} unit(s):\n", pending.len());
+    for (i, unit_id) in pending.iter().enumerate() {
+        let dep = &deps[*unit_id];
+        let unit = &units[*unit_id];
+        let sql = unit.read_sql()?;
+
+        println!("  {}. {}", i + 1, unit_id);
+        if !dep.depends_on_units.is_empty() {
+            println!("     depends on: {}", dep.depends_on_units.join(", "));
+        }
+        let ops = summarize_sql_operations(&sql);
+        if !ops.is_empty() {
+            println!("     operations: {}", ops);
+        }
+        if executor::needs_statement_mode(&sql) {
+            println!("     transaction: per-statement (ALTER TYPE ADD VALUE detected)");
+        }
+        println!();
+    }
+
+    // Confirm
+    if !yes {
+        use std::io::{self, Write};
+        print!("Proceed? [y/N] ");
+        io::stdout().flush()?;
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        if !input.trim().eq_ignore_ascii_case("y") {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
 
     // Run pre_apply hooks
     let root_abs = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
@@ -796,6 +862,100 @@ fn print_schema_comparison(ref_schema: &schema::SchemaSnapshot, temp_schema: &sc
     println!();
     let diff = temp_schema.diff(ref_schema);
     diff.display();
+}
+
+/// Summarize SQL operations in a human-readable string.
+fn summarize_sql_operations(sql: &str) -> String {
+    use std::collections::BTreeMap;
+
+    let mut counts: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    let analysis = parser::analyze(sql);
+
+    // Track CREATE TABLE with table names
+    for table in &analysis.creates {
+        counts.entry("CREATE TABLE").or_default().push(table.clone());
+    }
+
+    // Scan statements for other operations
+    for stmt in split_sql_statements(sql) {
+        let trimmed = stmt.trim();
+        if trimmed.is_empty() || trimmed == ";" {
+            continue;
+        }
+
+        // Find first meaningful line (skip comments)
+        let first_line = trimmed.lines()
+            .map(|l| l.trim())
+            .find(|l| !l.starts_with("--") && !l.is_empty())
+            .unwrap_or("")
+            .to_uppercase();
+
+        let op = if first_line.starts_with("ALTER TABLE") {
+            "ALTER TABLE"
+        } else if first_line.starts_with("ALTER TYPE") {
+            "ALTER TYPE"
+        } else if first_line.starts_with("CREATE INDEX") || first_line.starts_with("CREATE UNIQUE INDEX") {
+            "CREATE INDEX"
+        } else if first_line.starts_with("CREATE MATERIALIZED VIEW") {
+            "CREATE MATERIALIZED VIEW"
+        } else if first_line.starts_with("CREATE VIEW") || first_line.starts_with("CREATE OR REPLACE VIEW") {
+            "CREATE VIEW"
+        } else if first_line.starts_with("CREATE TYPE") {
+            "CREATE TYPE"
+        } else if first_line.starts_with("CREATE DOMAIN") {
+            "CREATE DOMAIN"
+        } else if first_line.starts_with("CREATE FUNCTION") || first_line.starts_with("CREATE OR REPLACE FUNCTION") {
+            "CREATE FUNCTION"
+        } else if first_line.starts_with("CREATE TRIGGER") {
+            "CREATE TRIGGER"
+        } else if first_line.starts_with("CREATE POLICY") {
+            "CREATE POLICY"
+        } else if first_line.starts_with("DROP TABLE") {
+            "DROP TABLE"
+        } else if first_line.starts_with("DROP VIEW") || first_line.starts_with("DROP MATERIALIZED VIEW") {
+            "DROP VIEW"
+        } else if first_line.starts_with("DROP TYPE") {
+            "DROP TYPE"
+        } else if first_line.starts_with("DROP INDEX") {
+            "DROP INDEX"
+        } else if first_line.starts_with("DROP FUNCTION") {
+            "DROP FUNCTION"
+        } else if first_line.starts_with("INSERT ") {
+            "INSERT"
+        } else if first_line.starts_with("UPDATE ") {
+            "UPDATE"
+        } else if first_line.starts_with("DELETE ") {
+            "DELETE"
+        } else if first_line.starts_with("TRUNCATE") {
+            "TRUNCATE"
+        } else if first_line.starts_with("GRANT ") {
+            "GRANT"
+        } else if first_line.starts_with("CREATE TABLE") {
+            // Already tracked by parser analysis
+            continue;
+        } else {
+            continue;
+        };
+
+        counts.entry(op).or_default().push(String::new());
+    }
+
+    let parts: Vec<String> = counts.iter().map(|(op, items)| {
+        let named: Vec<&String> = items.iter().filter(|s| !s.is_empty()).collect();
+        if named.is_empty() {
+            if items.len() == 1 {
+                op.to_string()
+            } else {
+                format!("{} x{}", op, items.len())
+            }
+        } else if named.len() <= 3 {
+            format!("{} {}", op, named.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "))
+        } else {
+            format!("{} x{}", op, items.len())
+        }
+    }).collect();
+
+    parts.join(", ")
 }
 
 fn replace_db_in_url(url: &str, new_db: &str) -> Result<String> {

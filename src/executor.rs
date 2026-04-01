@@ -5,7 +5,7 @@ use crate::discovery::Unit;
 use crate::ledger;
 
 /// Check if SQL contains ALTER TYPE ... ADD VALUE pattern.
-fn needs_statement_mode(sql: &str) -> bool {
+pub fn needs_statement_mode(sql: &str) -> bool {
     let upper = sql.to_uppercase();
     upper.contains("ADD VALUE") && upper.contains("ALTER TYPE")
 }
