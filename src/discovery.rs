@@ -10,6 +10,7 @@ pub struct Unit {
     /// Relative path from root (e.g. "users/add-email" or "0001_create_users.sql")
     pub id: String,
     /// Absolute path to the unit directory (or parent directory for file-per-unit)
+    #[allow(dead_code)]
     pub path: PathBuf,
     /// SQL files in filename order
     pub sql_files: Vec<PathBuf>,
@@ -17,6 +18,7 @@ pub struct Unit {
 
 /// Discovery mode determines how units are detected.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)]
 pub enum DiscoveryMode {
     /// Original mode: leaf directories = units
     Directory,
@@ -45,6 +47,7 @@ impl Unit {
     }
 
     /// Read and concatenate all SQL content in order (no Up extraction).
+    #[allow(dead_code)]
     pub fn read_sql(&self) -> Result<String> {
         self.read_sql_with_options(false)
     }
@@ -58,6 +61,7 @@ impl Unit {
     }
 
     /// Compute a SHA-256 checksum of all SQL content.
+    #[allow(dead_code)]
     pub fn checksum(&self) -> Result<String> {
         self.checksum_with_options(false)
     }

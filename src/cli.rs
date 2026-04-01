@@ -323,7 +323,7 @@ async fn apply_and_compare(
     let mut skip_count = 0usize;
     let mut failed_units: Vec<(String, String)> = Vec::new();
 
-    for (i, unit_id) in ordered_ids.iter().enumerate() {
+    for (_i, unit_id) in ordered_ids.iter().enumerate() {
         let unit = &units[unit_id];
         let sql = unit.read_sql_with_options(extract_up)?;
 
@@ -392,91 +392,6 @@ async fn apply_and_compare(
     print_schema_comparison(&ref_schema, &temp_schema);
 
     // Disconnect from temp DB before dropping
-    temp_pool.close().await;
-
-    Ok(())
-}
-
-/// Copy types, domains, casts from reference DB (pre-migration).
-/// Functions are copied separately after migrations to avoid dependency conflicts.
-async fn copy_types_from_ref(ref_url: &str, temp_url: &str) -> Result<()> {
-    let ref_pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(1)
-        .connect(ref_url)
-        .await?;
-    let temp_pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(1)
-        .connect(temp_url)
-        .await?;
-
-    // 1. Copy enum types
-    let enums: Vec<(String,)> = sqlx::query_as(
-        "SELECT t.typname FROM pg_type t
-         JOIN pg_namespace n ON t.typnamespace = n.oid
-         WHERE n.nspname = 'public' AND t.typtype = 'e'
-         ORDER BY t.typname"
-    ).fetch_all(&ref_pool).await.unwrap_or_default();
-
-    let mut enum_count = 0;
-    for (name,) in &enums {
-        let labels: Vec<(String,)> = sqlx::query_as(
-            "SELECT e.enumlabel FROM pg_enum e
-             JOIN pg_type t ON e.enumtypid = t.oid
-             JOIN pg_namespace n ON t.typnamespace = n.oid
-             WHERE n.nspname = 'public' AND t.typname = $1
-             ORDER BY e.enumsortorder"
-        ).bind(name).fetch_all(&ref_pool).await.unwrap_or_default();
-
-        let label_list: Vec<String> = labels.iter().map(|(l,)| format!("'{}'", l.replace('\'', "''"))).collect();
-        let sql = format!("CREATE TYPE \"{}\" AS ENUM ({})", name, label_list.join(", "));
-        if sqlx::raw_sql(&sql).execute(&temp_pool).await.is_ok() {
-            enum_count += 1;
-        }
-    }
-    println!("  Enums: {} copied", enum_count);
-
-    // 2. Copy domain types
-    let domain_defs: Vec<(String,)> = sqlx::query_as(
-        "SELECT format('CREATE DOMAIN %I AS %s %s',
-                t.typname,
-                format_type(t.typbasetype, t.typtypmod),
-                COALESCE((SELECT string_agg(pg_get_constraintdef(c.oid), ' ') FROM pg_constraint c WHERE c.contypid = t.oid), ''))
-         FROM pg_type t
-         JOIN pg_namespace n ON t.typnamespace = n.oid
-         WHERE n.nspname = 'public' AND t.typtype = 'd'
-         ORDER BY t.typname"
-    ).fetch_all(&ref_pool).await.unwrap_or_default();
-
-    let mut domain_count = 0;
-    for (def,) in &domain_defs {
-        if sqlx::raw_sql(def).execute(&temp_pool).await.is_ok() {
-            domain_count += 1;
-        }
-    }
-    println!("  Domains: {} copied", domain_count);
-
-    // 3. Copy casts
-    let casts: Vec<(String,)> = sqlx::query_as(
-        "SELECT format('CREATE CAST (%s AS %s) WITH INOUT AS IMPLICIT',
-                format_type(c.castsource, NULL),
-                format_type(c.casttarget, NULL))
-         FROM pg_cast c
-         JOIN pg_type st ON c.castsource = st.oid
-         JOIN pg_type tt ON c.casttarget = tt.oid
-         WHERE (EXISTS (SELECT 1 FROM pg_namespace n WHERE n.nspname = 'public' AND (st.typnamespace = n.oid OR tt.typnamespace = n.oid)))
-           AND c.castmethod = 'i'
-         ORDER BY 1"
-    ).fetch_all(&ref_pool).await.unwrap_or_default();
-
-    let mut cast_count = 0;
-    for (def,) in &casts {
-        if sqlx::raw_sql(def).execute(&temp_pool).await.is_ok() {
-            cast_count += 1;
-        }
-    }
-    println!("  Casts: {} copied", cast_count);
-
-    ref_pool.close().await;
     temp_pool.close().await;
 
     Ok(())

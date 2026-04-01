@@ -23,6 +23,7 @@ pub struct LockUnit {
 
 impl LockFile {
     /// Build a lock file from discovered units and resolved dependencies.
+    #[allow(dead_code)]
     pub fn from_units(
         units: &BTreeMap<String, Unit>,
         deps: &BTreeMap<String, UnitDependency>,
@@ -89,6 +90,7 @@ impl LockFile {
     }
 
     /// Validate that the lock file matches the current filesystem state.
+    #[allow(dead_code)]
     pub fn validate(&self, units: &BTreeMap<String, Unit>) -> Result<()> {
         self.validate_with_options(units, false)
     }
@@ -188,7 +190,7 @@ mod tests {
 
     #[test]
     fn test_validate_missing_unit() {
-        let dir = tempfile::tempdir().unwrap();
+        let _dir = tempfile::tempdir().unwrap();
         let lock = LockFile {
             version: 1,
             units: {

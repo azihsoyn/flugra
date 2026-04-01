@@ -27,6 +27,7 @@ pub struct SchemaSnapshot {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct TableInfo {
     pub name: String,
     pub columns: Vec<ColumnInfo>,
@@ -44,6 +45,7 @@ pub struct ColumnInfo {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ConstraintInfo {
     pub name: String,
     pub constraint_type: String,
@@ -57,6 +59,7 @@ pub struct IndexInfo {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct PolicyInfo {
     pub name: String,
     pub command: String,
@@ -67,6 +70,7 @@ pub struct PolicyInfo {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct TypeInfo {
     pub name: String,
     pub kind: String,
@@ -74,6 +78,7 @@ pub struct TypeInfo {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct FunctionInfo {
     pub name: String,
     pub result_type: String,
@@ -81,6 +86,7 @@ pub struct FunctionInfo {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ViewInfo {
     pub name: String,
     pub definition: String,
@@ -438,22 +444,12 @@ impl SchemaSnapshot {
         }
 
         SchemaDiff {
-            differences: Vec::new(), // kept for backward compat
             source_only,
             target_only,
             modified,
         }
     }
 
-    /// Format schema as a human-readable summary.
-    pub fn summary(&self) -> String {
-        let mut out = String::new();
-        out.push_str(&format!("Tables: {}\n", self.tables.len()));
-        out.push_str(&format!("Types: {}\n", self.types.len()));
-        out.push_str(&format!("Functions: {}\n", self.functions.len()));
-        out.push_str(&format!("Views: {}\n", self.views.len()));
-        out
-    }
 }
 
 fn diff_table(name: &str, a: &TableInfo, b: &TableInfo, modified: &mut Vec<String>) {
@@ -520,7 +516,6 @@ fn diff_table(name: &str, a: &TableInfo, b: &TableInfo, modified: &mut Vec<Strin
 
 #[derive(Debug)]
 pub struct SchemaDiff {
-    pub differences: Vec<String>,
     /// Objects only in migration result (source), not in reference DB
     pub source_only: Vec<String>,
     /// Objects only in reference DB (target), not in migration result

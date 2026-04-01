@@ -6,6 +6,7 @@ use crate::parser;
 
 /// Dependency information for a unit.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct UnitDependency {
     pub unit_id: String,
     /// Tables this unit creates
@@ -17,6 +18,7 @@ pub struct UnitDependency {
 }
 
 /// Build a dependency graph from discovered units.
+#[allow(dead_code)]
 pub fn resolve_dependencies(units: &BTreeMap<String, Unit>) -> Result<BTreeMap<String, UnitDependency>> {
     resolve_dependencies_with_options(units, false)
 }

@@ -21,6 +21,7 @@ pub async fn ensure_table(pool: &PgPool) -> Result<()> {
 }
 
 /// Record a unit as applied.
+#[allow(dead_code)]
 pub async fn record(pool: &PgPool, unit_id: &str, checksum: &str) -> Result<()> {
     sqlx::query(&format!(
         "INSERT INTO {} (unit_id, checksum) VALUES ($1, $2)
