@@ -184,6 +184,10 @@ pre_apply:
     description: "Deploy plv8 functions before migrations"
 ```
 
+## Supported Databases
+
+Currently **PostgreSQL only**.
+
 ## Building
 
 ```sh
