@@ -316,27 +316,54 @@ async fn apply_and_compare(
     hooks::run_hooks(&hooks_config.pre_apply, "pre_apply", temp_url, &root_abs)?;
 
     // Apply all migrations to temp database
-    println!("\nApplying {} migration(s) to temporary database...\n", ordered_ids.len());
+    println!("\nApplying {} migration(s) to temporary database...", ordered_ids.len());
+
+    let mut ok_count = 0usize;
+    let mut fail_count = 0usize;
+    let mut skip_count = 0usize;
+    let mut failed_units: Vec<(String, String)> = Vec::new();
 
     for (i, unit_id) in ordered_ids.iter().enumerate() {
         let unit = &units[unit_id];
         let sql = unit.read_sql_with_options(extract_up)?;
 
         if sql.trim().is_empty() {
-            println!("  [{}/{}] Skipping (empty): {}", i + 1, ordered_ids.len(), unit_id);
+            skip_count += 1;
             continue;
         }
 
-        print!("  [{}/{}] Applying: {} ... ", i + 1, ordered_ids.len(), unit_id);
         match execute_migration_sql(&temp_pool, &sql).await {
-            Ok(_) => println!("OK"),
+            Ok(_) => {
+                ok_count += 1;
+            }
             Err(e) => {
-                println!("FAILED");
-                println!("    Error: {}", e);
-                println!("    Continuing with remaining migrations...");
+                fail_count += 1;
+                let err_msg = format!("{}", e);
+                failed_units.push((unit_id.clone(), err_msg));
             }
         }
+
     }
+
+    // Print progress as a single line
+    print!("  Progress: {}/{}", ordered_ids.len(), ordered_ids.len());
+    if fail_count > 0 {
+        print!(" ({} failed)", fail_count);
+    }
+    println!();
+
+    // Show failed migrations
+    if !failed_units.is_empty() {
+        println!("\nFailed migrations:");
+        for (unit_id, err) in &failed_units {
+            println!("  {} -- {}", unit_id, err);
+        }
+    }
+
+    println!(
+        "\nMigration summary: {} OK, {} failed, {} skipped",
+        ok_count, fail_count, skip_count
+    );
 
     // Run post_apply hooks against the temporary database
     hooks::run_hooks(&hooks_config.post_apply, "post_apply", temp_url, &root_abs)?;
@@ -351,39 +378,18 @@ async fn apply_and_compare(
             .connect(temp_url)
             .await?;
 
-        println!("\nDumping schemas...");
         let ref_schema = schema::dump_schema(ref_pool).await?;
         let temp_schema = schema::dump_schema(&temp_pool).await?;
-
-        println!("\nReference database schema:");
-        print!("{}", ref_schema.summary());
-        println!("\nMigration result schema:");
-        print!("{}", temp_schema.summary());
-        println!("\n--- Schema Diff ---\n");
-        let diff = temp_schema.diff(&ref_schema);
-        diff.display();
-
+        print_schema_comparison(&ref_schema, &temp_schema);
         temp_pool.close().await;
         return Ok(());
     }
 
-    // Dump schemas from both databases
-    println!("\nDumping schemas...");
+    // Dump and compare schemas
+    println!("\nComparing schemas...");
     let ref_schema = schema::dump_schema(ref_pool).await?;
     let temp_schema = schema::dump_schema(&temp_pool).await?;
-
-    println!("\nReference database schema:");
-    print!("{}", ref_schema.summary());
-
-    println!("\nMigration result schema:");
-    print!("{}", temp_schema.summary());
-
-    // Compare
-    println!("\n--- Schema Diff ---\n");
-
-    // source = migration result (temp), target = reference DB
-    let diff = temp_schema.diff(&ref_schema);
-    diff.display();
+    print_schema_comparison(&ref_schema, &temp_schema);
 
     // Disconnect from temp DB before dropping
     temp_pool.close().await;
@@ -716,6 +722,19 @@ pub fn split_sql_statements(sql: &str) -> Vec<String> {
     }
 
     statements
+}
+
+fn print_schema_comparison(ref_schema: &schema::SchemaSnapshot, temp_schema: &schema::SchemaSnapshot) {
+    println!("\n  Schema Comparison:");
+    println!("  {:<24} {:>8}  {:>8}", "", "Reference", "Migration");
+    println!("  {:<24} {:>8}  {:>8}", "Tables", ref_schema.tables.len(), temp_schema.tables.len());
+    println!("  {:<24} {:>8}  {:>8}", "Types", ref_schema.types.len(), temp_schema.types.len());
+    println!("  {:<24} {:>8}  {:>8}", "Functions", ref_schema.functions.len(), temp_schema.functions.len());
+    println!("  {:<24} {:>8}  {:>8}", "Views", ref_schema.views.len(), temp_schema.views.len());
+
+    println!();
+    let diff = temp_schema.diff(ref_schema);
+    diff.display();
 }
 
 /// Replace the database name in a PostgreSQL connection URL.

@@ -366,21 +366,24 @@ async fn dump_views(pool: &PgPool) -> Result<BTreeMap<String, ViewInfo>> {
 }
 
 impl SchemaSnapshot {
-    /// Compare two snapshots and return differences.
+    /// Compare two snapshots and return categorized differences.
+    /// `self` = migration result (source), `other` = reference DB (target).
     pub fn diff(&self, other: &SchemaSnapshot) -> SchemaDiff {
-        let mut diffs = Vec::new();
+        let mut source_only = Vec::new();
+        let mut target_only = Vec::new();
+        let mut modified = Vec::new();
 
         // Compare tables
         for (name, table) in &self.tables {
             if let Some(other_table) = other.tables.get(name) {
-                diff_table(name, table, other_table, &mut diffs);
+                diff_table(name, table, other_table, &mut modified);
             } else {
-                diffs.push(format!("Table '{}': exists in source but not in target", name));
+                source_only.push(format!("Table '{}'", name));
             }
         }
         for name in other.tables.keys() {
             if !self.tables.contains_key(name) {
-                diffs.push(format!("Table '{}': exists in target but not in source", name));
+                target_only.push(format!("Table '{}'", name));
             }
         }
 
@@ -388,32 +391,30 @@ impl SchemaSnapshot {
         for (name, t) in &self.types {
             if let Some(other_t) = other.types.get(name) {
                 if t.kind != other_t.kind {
-                    diffs.push(format!("Type '{}': kind differs ({} vs {})", name, t.kind, other_t.kind));
+                    modified.push(format!("Type '{}': kind ({} vs {})", name, t.kind, other_t.kind));
                 }
                 if t.labels != other_t.labels {
-                    diffs.push(format!("Type '{}': labels differ", name));
-                    diffs.push(format!("  source: {:?}", t.labels));
-                    diffs.push(format!("  target: {:?}", other_t.labels));
+                    modified.push(format!("Type '{}': labels differ", name));
                 }
             } else {
-                diffs.push(format!("Type '{}': exists in source but not in target", name));
+                source_only.push(format!("Type '{}'", name));
             }
         }
         for name in other.types.keys() {
             if !self.types.contains_key(name) {
-                diffs.push(format!("Type '{}': exists in target but not in source", name));
+                target_only.push(format!("Type '{}'", name));
             }
         }
 
         // Compare functions
         for name in self.functions.keys() {
             if !other.functions.contains_key(name) {
-                diffs.push(format!("Function '{}': exists in source but not in target", name));
+                source_only.push(format!("Function '{}'", name));
             }
         }
         for name in other.functions.keys() {
             if !self.functions.contains_key(name) {
-                diffs.push(format!("Function '{}': exists in target but not in source", name));
+                target_only.push(format!("Function '{}'", name));
             }
         }
 
@@ -421,23 +422,26 @@ impl SchemaSnapshot {
         for (name, v) in &self.views {
             if let Some(other_v) = other.views.get(name) {
                 if v.definition != other_v.definition {
-                    diffs.push(format!("View '{}': definition differs", name));
+                    modified.push(format!("View '{}': definition differs", name));
                 }
                 if v.is_materialized != other_v.is_materialized {
-                    diffs.push(format!("View '{}': materialized flag differs", name));
+                    modified.push(format!("View '{}': materialized flag differs", name));
                 }
             } else {
-                diffs.push(format!("View '{}': exists in source but not in target", name));
+                source_only.push(format!("View '{}'", name));
             }
         }
         for name in other.views.keys() {
             if !self.views.contains_key(name) {
-                diffs.push(format!("View '{}': exists in target but not in source", name));
+                target_only.push(format!("View '{}'", name));
             }
         }
 
         SchemaDiff {
-            differences: diffs,
+            differences: Vec::new(), // kept for backward compat
+            source_only,
+            target_only,
+            modified,
         }
     }
 
@@ -452,100 +456,64 @@ impl SchemaSnapshot {
     }
 }
 
-fn diff_table(name: &str, a: &TableInfo, b: &TableInfo, diffs: &mut Vec<String>) {
-    // Compare columns
+fn diff_table(name: &str, a: &TableInfo, b: &TableInfo, modified: &mut Vec<String>) {
     let a_cols: BTreeMap<_, _> = a.columns.iter().map(|c| (c.name.clone(), c)).collect();
     let b_cols: BTreeMap<_, _> = b.columns.iter().map(|c| (c.name.clone(), c)).collect();
 
     for (col_name, col) in &a_cols {
         if let Some(other_col) = b_cols.get(col_name) {
             if col.data_type != other_col.data_type {
-                diffs.push(format!(
-                    "Table '{}' column '{}': type differs ('{}' vs '{}')",
-                    name, col_name, col.data_type, other_col.data_type
-                ));
+                modified.push(format!("Table '{}'.{}: type ({} vs {})", name, col_name, col.data_type, other_col.data_type));
             }
             if col.is_nullable != other_col.is_nullable {
-                diffs.push(format!(
-                    "Table '{}' column '{}': nullable differs ({} vs {})",
-                    name, col_name, col.is_nullable, other_col.is_nullable
-                ));
+                modified.push(format!("Table '{}'.{}: nullable ({} vs {})", name, col_name, col.is_nullable, other_col.is_nullable));
             }
             if col.column_default != other_col.column_default {
-                diffs.push(format!(
-                    "Table '{}' column '{}': default differs ({:?} vs {:?})",
-                    name, col_name, col.column_default, other_col.column_default
-                ));
+                modified.push(format!("Table '{}'.{}: default differs", name, col_name));
             }
         } else {
-            diffs.push(format!(
-                "Table '{}' column '{}': exists in source but not in target",
-                name, col_name
-            ));
+            modified.push(format!("Table '{}'.{}: column only in migration result", name, col_name));
         }
     }
     for col_name in b_cols.keys() {
         if !a_cols.contains_key(col_name) {
-            diffs.push(format!(
-                "Table '{}' column '{}': exists in target but not in source",
-                name, col_name
-            ));
+            modified.push(format!("Table '{}'.{}: column only in reference DB", name, col_name));
         }
     }
 
-    // Compare constraints
     let a_cons: BTreeMap<_, _> = a.constraints.iter().map(|c| (c.name.clone(), c)).collect();
     let b_cons: BTreeMap<_, _> = b.constraints.iter().map(|c| (c.name.clone(), c)).collect();
 
     for (con_name, con) in &a_cons {
         if let Some(other_con) = b_cons.get(con_name) {
             if con.definition != other_con.definition {
-                diffs.push(format!(
-                    "Table '{}' constraint '{}': definition differs",
-                    name, con_name
-                ));
+                modified.push(format!("Table '{}' constraint '{}': definition differs", name, con_name));
             }
         } else {
-            diffs.push(format!(
-                "Table '{}' constraint '{}': exists in source but not in target",
-                name, con_name
-            ));
+            modified.push(format!("Table '{}' constraint '{}': only in migration result", name, con_name));
         }
     }
     for con_name in b_cons.keys() {
         if !a_cons.contains_key(con_name) {
-            diffs.push(format!(
-                "Table '{}' constraint '{}': exists in target but not in source",
-                name, con_name
-            ));
+            modified.push(format!("Table '{}' constraint '{}': only in reference DB", name, con_name));
         }
     }
 
-    // Compare indexes
     let a_idx: BTreeMap<_, _> = a.indexes.iter().map(|i| (i.name.clone(), i)).collect();
     let b_idx: BTreeMap<_, _> = b.indexes.iter().map(|i| (i.name.clone(), i)).collect();
 
     for (idx_name, idx) in &a_idx {
         if let Some(other_idx) = b_idx.get(idx_name) {
             if idx.definition != other_idx.definition {
-                diffs.push(format!(
-                    "Table '{}' index '{}': definition differs",
-                    name, idx_name
-                ));
+                modified.push(format!("Table '{}' index '{}': definition differs", name, idx_name));
             }
         } else {
-            diffs.push(format!(
-                "Table '{}' index '{}': exists in source but not in target",
-                name, idx_name
-            ));
+            modified.push(format!("Table '{}' index '{}': only in migration result", name, idx_name));
         }
     }
     for idx_name in b_idx.keys() {
         if !a_idx.contains_key(idx_name) {
-            diffs.push(format!(
-                "Table '{}' index '{}': exists in target but not in source",
-                name, idx_name
-            ));
+            modified.push(format!("Table '{}' index '{}': only in reference DB", name, idx_name));
         }
     }
 }
@@ -553,20 +521,49 @@ fn diff_table(name: &str, a: &TableInfo, b: &TableInfo, diffs: &mut Vec<String>)
 #[derive(Debug)]
 pub struct SchemaDiff {
     pub differences: Vec<String>,
+    /// Objects only in migration result (source), not in reference DB
+    pub source_only: Vec<String>,
+    /// Objects only in reference DB (target), not in migration result
+    pub target_only: Vec<String>,
+    /// Objects that exist in both but differ
+    pub modified: Vec<String>,
 }
 
 impl SchemaDiff {
     pub fn is_empty(&self) -> bool {
-        self.differences.is_empty()
+        self.source_only.is_empty() && self.target_only.is_empty() && self.modified.is_empty()
+    }
+
+    pub fn total_count(&self) -> usize {
+        self.source_only.len() + self.target_only.len() + self.modified.len()
     }
 
     pub fn display(&self) {
         if self.is_empty() {
             println!("Schemas are identical.");
-        } else {
-            println!("Found {} difference(s):\n", self.differences.len());
-            for diff in &self.differences {
-                println!("  {}", diff);
+            return;
+        }
+
+        println!("Found {} difference(s):", self.total_count());
+
+        if !self.target_only.is_empty() {
+            println!("\n  Only in reference DB ({}):", self.target_only.len());
+            for item in &self.target_only {
+                println!("    + {}", item);
+            }
+        }
+
+        if !self.source_only.is_empty() {
+            println!("\n  Only in migration result ({}):", self.source_only.len());
+            for item in &self.source_only {
+                println!("    - {}", item);
+            }
+        }
+
+        if !self.modified.is_empty() {
+            println!("\n  Modified ({}):", self.modified.len());
+            for item in &self.modified {
+                println!("    ~ {}", item);
             }
         }
     }
