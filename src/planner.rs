@@ -18,17 +18,10 @@ pub struct UnitDependency {
 }
 
 /// Build a dependency graph from discovered units.
-#[allow(dead_code)]
 pub fn resolve_dependencies(units: &BTreeMap<String, Unit>) -> Result<BTreeMap<String, UnitDependency>> {
-    resolve_dependencies_with_options(units, false)
-}
-
-/// Build a dependency graph, optionally extracting Up sections.
-pub fn resolve_dependencies_with_options(units: &BTreeMap<String, Unit>, extract_up: bool) -> Result<BTreeMap<String, UnitDependency>> {
-    // First pass: analyze each unit's SQL
     let mut analyses: BTreeMap<String, parser::SqlAnalysis> = BTreeMap::new();
     for (id, unit) in units {
-        let sql = unit.read_sql_with_options(extract_up)?;
+        let sql = unit.read_sql()?;
         analyses.insert(id.clone(), parser::analyze(&sql));
     }
 

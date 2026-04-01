@@ -2,34 +2,26 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-use crate::{discovery, executor, hooks, ledger, lock::LockFile, planner, schema};
+use crate::{discovery, executor, hooks, ledger, planner, schema};
 
 #[derive(Parser)]
-#[command(name = "flugra", about = "Dependency-aware execution manager for native SQL units")]
+#[command(name = "flugra", about = "fluent migration — dependency-aware execution manager for native SQL units")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
-
-    /// Extract only "Up" section from migration files
-    /// (for migration files with Up/Down sections)
-    #[arg(long, global = true, default_value = "false")]
-    pub extract_up: bool,
 }
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Discover units, build dependency graph, and show execution plan
+    /// Show pending units and execution plan
     Plan {
         /// Root directory containing SQL units
         #[arg(default_value = ".")]
         root: PathBuf,
-    },
 
-    /// Generate or update the lock file
-    Lock {
-        /// Root directory containing SQL units
-        #[arg(default_value = ".")]
-        root: PathBuf,
+        /// Database connection URL
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
     },
 
     /// Apply pending units to the database
@@ -38,19 +30,35 @@ pub enum Command {
         #[arg(default_value = ".")]
         root: PathBuf,
 
-        /// Database connection URL (e.g., postgres://user:pass@localhost/db)
-        #[arg(long, env = "DATABASE_URL")]
-        database_url: String,
-    },
-
-    /// Show applied and pending units
-    Status {
         /// Database connection URL
         #[arg(long, env = "DATABASE_URL")]
         database_url: String,
     },
 
-    /// Compare database schema with migration result
+    /// Import existing migration state into the ledger
+    ///
+    /// Determines which units have already been applied by comparing schemas:
+    /// applies all migrations to a temporary database and compares the result
+    /// with the reference database to find the boundary between applied and pending.
+    Import {
+        /// Root directory containing SQL units
+        #[arg(default_value = ".")]
+        root: PathBuf,
+
+        /// Database connection URL
+        #[arg(long, env = "DATABASE_URL")]
+        database_url: String,
+
+        /// Show what would be imported without actually writing
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Skip confirmation prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+
+    /// Verify migrations by comparing schemas
     ///
     /// Applies all migrations to a temporary database and compares
     /// the resulting schema against a reference database.
@@ -63,26 +71,14 @@ pub enum Command {
         #[arg(default_value = ".")]
         root: PathBuf,
 
-        /// Copy functions, domains, and custom types from reference DB
-        /// before applying migrations (for projects with externally managed functions)
+        /// Copy functions from reference DB before applying migrations
+        /// (for projects with externally managed functions)
         #[arg(long)]
         copy_schema_objects: bool,
     },
-
-    /// Convert existing flat migration files to flugra native format
-    ///
-    /// Reads migration files with Up/Down sections, extracts Up sections,
-    /// and creates directory-per-unit structure.
-    Convert {
-        /// Source directory containing flat migration files
-        source: PathBuf,
-
-        /// Output directory for flugra native format
-        output: PathBuf,
-    },
 }
 
-pub async fn plan(root: &PathBuf, extract_up: bool) -> Result<()> {
+pub async fn plan(root: &PathBuf, database_url: &str) -> Result<()> {
     let units = discovery::discover(root)?;
 
     if units.is_empty() {
@@ -90,82 +86,70 @@ pub async fn plan(root: &PathBuf, extract_up: bool) -> Result<()> {
         return Ok(());
     }
 
-    println!("Discovered {} unit(s):\n", units.len());
-
-    let deps = planner::resolve_dependencies_with_options(&units, extract_up)?;
+    let deps = planner::resolve_dependencies(&units)?;
     planner::validate_no_cycles(&deps)?;
     let order = planner::execution_order(&deps)?;
 
-    for (i, unit_id) in order.iter().enumerate() {
-        let dep = &deps[unit_id];
-        let unit = &units[unit_id];
-
-        println!("  {}. {}", i + 1, unit_id);
-
-        // Show SQL files
-        for f in &unit.sql_files {
-            println!("     - {}", f.file_name().unwrap_or_default().to_string_lossy());
-        }
-
-        // Show creates
-        if !dep.creates.is_empty() {
-            let tables: Vec<_> = dep.creates.iter().collect();
-            println!("     creates: {}", tables.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
-        }
-
-        // Show dependencies
-        if !dep.depends_on_units.is_empty() {
-            println!("     depends on: {}", dep.depends_on_units.join(", "));
-        }
-
-        println!();
+    // Compute checksums
+    let mut checksums: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for (id, unit) in &units {
+        checksums.insert(id.clone(), unit.checksum()?);
     }
 
-    Ok(())
-}
+    // Connect to database
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(database_url)
+        .await
+        .context("Failed to connect to database")?;
 
-pub async fn lock(root: &PathBuf, extract_up: bool) -> Result<()> {
-    let units = discovery::discover(root)?;
+    ledger::ensure_table(&pool).await?;
+    let applied = ledger::applied_units(&pool).await?;
 
-    if units.is_empty() {
-        println!("No SQL units found in {}", root.display());
+    let pending: Vec<&String> = order.iter().filter(|id| !applied.contains(*id)).collect();
+
+    if pending.is_empty() {
+        println!("All {} unit(s) are already applied.", order.len());
         return Ok(());
     }
 
-    let deps = planner::resolve_dependencies_with_options(&units, extract_up)?;
-    planner::validate_no_cycles(&deps)?;
+    println!("Pending {} unit(s) (of {} total):\n", pending.len(), order.len());
+    for (i, unit_id) in pending.iter().enumerate() {
+        let dep = &deps[*unit_id];
+        let checksum = &checksums[*unit_id];
+        print!("  {}. {} ({}...)", i + 1, unit_id, &checksum[..8.min(checksum.len())]);
+        if !dep.depends_on_units.is_empty() {
+            print!(" depends on: {}", dep.depends_on_units.join(", "));
+        }
+        println!();
+    }
 
-    let lock = LockFile::from_units_with_options(&units, &deps, extract_up)?;
-    lock.write(root)?;
+    println!("\nAlready applied: {} unit(s)", applied.len());
 
-    println!("Lock file written with {} unit(s)", lock.units.len());
     Ok(())
 }
 
-pub async fn apply(root: &PathBuf, database_url: &str, extract_up: bool) -> Result<()> {
-    // Load hooks
+pub async fn apply(root: &PathBuf, database_url: &str) -> Result<()> {
     let hooks_config = hooks::HooksConfig::load(root)?;
     if hooks_config.has_hooks() {
         println!("Loaded hooks from flugra.hooks.yaml");
     }
 
-    // Load and validate lock file
-    let lock = LockFile::read(root)?;
     let units = discovery::discover(root)?;
-    lock.validate_with_options(&units, extract_up)?;
+    if units.is_empty() {
+        println!("No SQL units found in {}", root.display());
+        return Ok(());
+    }
 
-    // Build dependency graph from lock file for ordering
-    let deps = planner::resolve_dependencies_with_options(&units, extract_up)?;
+    let deps = planner::resolve_dependencies(&units)?;
+    planner::validate_no_cycles(&deps)?;
     let order = planner::execution_order(&deps)?;
 
-    // Collect checksums from lock
-    let checksums: std::collections::BTreeMap<String, String> = lock
-        .units
-        .iter()
-        .map(|(id, u)| (id.clone(), u.checksum.clone()))
-        .collect();
+    let mut checksums: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for (id, unit) in &units {
+        checksums.insert(id.clone(), unit.checksum()?);
+    }
 
-    // Connect to database
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
         .connect(database_url)
@@ -176,8 +160,8 @@ pub async fn apply(root: &PathBuf, database_url: &str, extract_up: bool) -> Resu
     let root_abs = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     hooks::run_hooks(&hooks_config.pre_apply, "pre_apply", database_url, &root_abs)?;
 
-    println!("\nApplying migrations...\n");
-    let result = executor::apply_all(&pool, &units, &order, &checksums, extract_up).await?;
+    println!("Applying migrations...\n");
+    let result = executor::apply_all(&pool, &units, &order, &checksums).await?;
 
     // Run post_apply hooks
     hooks::run_hooks(&hooks_config.post_apply, "post_apply", database_url, &root_abs)?;
@@ -190,34 +174,8 @@ pub async fn apply(root: &PathBuf, database_url: &str, extract_up: bool) -> Resu
     Ok(())
 }
 
-pub async fn status(database_url: &str) -> Result<()> {
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(1)
-        .connect(database_url)
-        .await
-        .context("Failed to connect to database")?;
-
-    ledger::ensure_table(&pool).await?;
-    let applied = ledger::applied_units_detail(&pool).await?;
-
-    if applied.is_empty() {
-        println!("No units have been applied yet.");
-    } else {
-        println!("Applied units:\n");
-        for unit in &applied {
-            println!(
-                "  {} (checksum: {}..., applied: {})",
-                unit.unit_id,
-                &unit.checksum[..8.min(unit.checksum.len())],
-                unit.applied_at.format("%Y-%m-%d %H:%M:%S UTC")
-            );
-        }
-    }
-
-    Ok(())
-}
-
-pub async fn diff(database_url: &str, root: &PathBuf, extract_up: bool, copy_schema_objects: bool) -> Result<()> {
+pub async fn import(root: &PathBuf, database_url: &str, dry_run: bool, yes: bool) -> Result<()> {
+    let hooks_config = hooks::HooksConfig::load(root)?;
     let units = discovery::discover(root)?;
 
     if units.is_empty() {
@@ -225,7 +183,240 @@ pub async fn diff(database_url: &str, root: &PathBuf, extract_up: bool, copy_sch
         return Ok(());
     }
 
-    // Load hooks from migration root
+    let ordered_ids: Vec<String> = units.keys().cloned().collect();
+    println!("Discovered {} unit(s)", ordered_ids.len());
+
+    let ref_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(database_url)
+        .await
+        .context("Failed to connect to database")?;
+
+    println!("Snapshotting reference database schema...");
+    let ref_schema = schema::dump_schema(&ref_pool).await?;
+
+    let temp_db_name = format!("flugra_import_{}", std::process::id());
+    println!("Creating temporary database '{}'...", temp_db_name);
+
+    sqlx::query(&format!("CREATE DATABASE \"{}\"", temp_db_name))
+        .execute(&ref_pool)
+        .await
+        .with_context(|| format!("Failed to create temporary database '{}'", temp_db_name))?;
+
+    let temp_url = replace_db_in_url(database_url, &temp_db_name)?;
+
+    let result = import_detect_applied(
+        &ref_pool, &ref_schema, &temp_url,
+        &units, &ordered_ids, dry_run, yes, &hooks_config, root,
+    ).await;
+
+    println!("Dropping temporary database '{}'...", temp_db_name);
+    let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS \"{}\"", temp_db_name))
+        .execute(&ref_pool)
+        .await;
+
+    result
+}
+
+async fn import_detect_applied(
+    ref_pool: &sqlx::PgPool,
+    ref_schema: &schema::SchemaSnapshot,
+    temp_url: &str,
+    units: &std::collections::BTreeMap<String, discovery::Unit>,
+    ordered_ids: &[String],
+    dry_run: bool,
+    yes: bool,
+    hooks_config: &hooks::HooksConfig,
+    root: &PathBuf,
+) -> Result<()> {
+    let temp_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(temp_url)
+        .await
+        .context("Failed to connect to temporary database")?;
+
+    // Install extensions from reference DB
+    let extensions: Vec<(String,)> = sqlx::query_as(
+        "SELECT extname FROM pg_extension WHERE extname != 'plpgsql' ORDER BY extname"
+    ).fetch_all(ref_pool).await.unwrap_or_default();
+
+    for (ext,) in &extensions {
+        let sql = format!("CREATE EXTENSION IF NOT EXISTS \"{}\" CASCADE", ext);
+        let _ = sqlx::raw_sql(&sql).execute(&temp_pool).await;
+    }
+
+    // Run pre_apply hooks
+    let root_abs = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    hooks::run_hooks(&hooks_config.pre_apply, "pre_apply", temp_url, &root_abs)?;
+
+    println!("\nApplying all migrations to temporary database...");
+
+    let mut apply_results: Vec<(String, bool)> = Vec::new();
+    for unit_id in ordered_ids {
+        let unit = &units[unit_id];
+        let sql = unit.read_sql()?;
+        if sql.trim().is_empty() {
+            apply_results.push((unit_id.clone(), true));
+            continue;
+        }
+        let ok = execute_migration_sql(&temp_pool, &sql).await.is_ok();
+        apply_results.push((unit_id.clone(), ok));
+    }
+    let ok_count = apply_results.iter().filter(|(_, ok)| *ok).count();
+    let fail_count = apply_results.iter().filter(|(_, ok)| !*ok).count();
+    println!("  Applied: {}, Failed: {}", ok_count, fail_count);
+
+    // Compare final temp schema with reference
+    let temp_schema = schema::dump_schema(&temp_pool).await?;
+    let diff = temp_schema.diff(ref_schema);
+
+    let applied_ids: Vec<String>;
+    let pending_ids: Vec<String>;
+
+    if diff.source_only.is_empty() && diff.modified.is_empty() {
+        println!("  All migration objects exist in reference DB.");
+        applied_ids = ordered_ids.to_vec();
+        pending_ids = Vec::new();
+    } else {
+        println!("  Found {} object(s) not in reference DB. Detecting boundary...", diff.source_only.len() + diff.modified.len());
+
+        let extra_names: std::collections::HashSet<String> = diff.source_only.iter()
+            .filter_map(|s| s.split('\'').nth(1).map(|n| n.to_string()))
+            .collect();
+
+        let mut boundary = ordered_ids.len();
+        for (i, unit_id) in ordered_ids.iter().enumerate() {
+            let unit = &units[unit_id];
+            let sql = unit.read_sql()?;
+            let analysis = crate::parser::analyze(&sql);
+
+            for table in &analysis.creates {
+                if extra_names.contains(table) {
+                    boundary = i;
+                    break;
+                }
+            }
+            if boundary < ordered_ids.len() {
+                break;
+            }
+        }
+
+        applied_ids = ordered_ids[..boundary].to_vec();
+        pending_ids = ordered_ids[boundary..].to_vec();
+    }
+
+    println!("  Result: {} applied, {} pending", applied_ids.len(), pending_ids.len());
+
+    // Build import list with checksums
+    let mut to_import: Vec<(String, String)> = Vec::new();
+    for id in &applied_ids {
+        let unit = &units[id];
+        let checksum = unit.checksum()?;
+        to_import.push((id.clone(), checksum));
+    }
+
+    // Check schema_migrations table state
+    let table_exists: (bool,) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'schema_migrations')"
+    ).fetch_one(ref_pool).await.unwrap_or((false,));
+
+    let existing_ids: std::collections::HashSet<String> = if table_exists.0 {
+        ledger::applied_units(ref_pool).await.unwrap_or_default()
+    } else {
+        std::collections::HashSet::new()
+    };
+    let new_records: Vec<&(String, String)> = to_import.iter()
+        .filter(|(id, _)| !existing_ids.contains(id))
+        .collect();
+
+    // Show schema_migrations table state
+    println!();
+    if !table_exists.0 {
+        println!("Table 'schema_migrations' does not exist and will be created.");
+    } else if !existing_ids.is_empty() {
+        println!("Table 'schema_migrations' already exists with {} record(s).", existing_ids.len());
+    }
+    println!("{} record(s) will be inserted into schema_migrations.", new_records.len());
+    if !new_records.is_empty() && !existing_ids.is_empty() {
+        let overlap = to_import.len() - new_records.len();
+        if overlap > 0 {
+            println!("{} record(s) already exist and will be skipped.", overlap);
+        }
+    }
+
+    // Show unit list
+    let label = if dry_run { "[DRY RUN] Would import" } else { "Will import" };
+    println!("\n{} {} unit(s) as applied:\n", label, to_import.len());
+    for (id, checksum) in &to_import {
+        let marker = if existing_ids.contains(id) { " (already in ledger)" } else { "" };
+        println!("  {} (checksum: {}...){}", id, &checksum[..8.min(checksum.len())], marker);
+    }
+
+    if !pending_ids.is_empty() {
+        println!("\nPending (not yet applied to reference DB): {} unit(s)\n", pending_ids.len());
+        for id in &pending_ids {
+            println!("  {}", id);
+        }
+    }
+
+    println!("\nSummary:");
+    println!("  Applied:    {}", applied_ids.len());
+    println!("  To insert:  {}", new_records.len());
+    println!("  Pending:    {}", pending_ids.len());
+    println!("  Total:      {}", ordered_ids.len());
+
+    if dry_run {
+        temp_pool.close().await;
+        return Ok(());
+    }
+
+    // Confirm before writing
+    if !yes {
+        use std::io::{self, Write};
+        print!("\nProceed? [y/N] ");
+        io::stdout().flush()?;
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        if !input.trim().eq_ignore_ascii_case("y") {
+            println!("Aborted.");
+            temp_pool.close().await;
+            return Ok(());
+        }
+    }
+
+    println!("\nImporting {} unit(s) into schema_migrations...\n", to_import.len());
+
+    ledger::ensure_table(ref_pool).await?;
+    let already = ledger::applied_units(ref_pool).await?;
+    let mut imported = 0;
+    let mut skipped = 0;
+
+    for (id, checksum) in &to_import {
+        if already.contains(id) {
+            skipped += 1;
+            continue;
+        }
+        ledger::record(ref_pool, id, checksum).await?;
+        imported += 1;
+    }
+
+    println!(
+        "Done. Imported: {}, Already in ledger: {}, Pending: {}",
+        imported, skipped, pending_ids.len()
+    );
+
+    temp_pool.close().await;
+    Ok(())
+}
+
+pub async fn diff(database_url: &str, root: &PathBuf, copy_schema_objects: bool) -> Result<()> {
+    let units = discovery::discover(root)?;
+
+    if units.is_empty() {
+        println!("No SQL units found in {}", root.display());
+        return Ok(());
+    }
+
     let hooks_config = hooks::HooksConfig::load(root)?;
     if hooks_config.has_hooks() {
         println!("Loaded hooks from flugra.hooks.yaml");
@@ -233,18 +424,15 @@ pub async fn diff(database_url: &str, root: &PathBuf, extract_up: bool, copy_sch
 
     println!("Discovered {} unit(s) in {}", units.len(), root.display());
 
-    // Sort units by ID (filename order = execution order for flat migrations)
     let mut ordered_ids: Vec<String> = units.keys().cloned().collect();
     ordered_ids.sort();
 
-    // Connect to the reference database
     let ref_pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
         .connect(database_url)
         .await
         .context("Failed to connect to reference database")?;
 
-    // Create a temporary database for applying migrations
     let temp_db_name = format!("flugra_diff_{}", std::process::id());
     println!("Creating temporary database '{}'...", temp_db_name);
 
@@ -253,14 +441,11 @@ pub async fn diff(database_url: &str, root: &PathBuf, extract_up: bool, copy_sch
         .await
         .with_context(|| format!("Failed to create temporary database '{}'", temp_db_name))?;
 
-    // Build connection URL for temp database
     let temp_url = replace_db_in_url(database_url, &temp_db_name)?;
 
-    let result = apply_and_compare(&ref_pool, &temp_url, database_url, &temp_db_name, &units, &ordered_ids, extract_up, copy_schema_objects, &hooks_config, root).await;
+    let result = apply_and_compare(&ref_pool, &temp_url, database_url, &units, &ordered_ids, copy_schema_objects, &hooks_config, root).await;
 
-    // Clean up: drop temporary database
     println!("Dropping temporary database '{}'...", temp_db_name);
-    // Close ref_pool connection to temp DB won't block drop
     let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS \"{}\"", temp_db_name))
         .execute(&ref_pool)
         .await;
@@ -272,10 +457,8 @@ async fn apply_and_compare(
     ref_pool: &sqlx::PgPool,
     temp_url: &str,
     ref_url: &str,
-    _temp_db_name: &str,
     units: &std::collections::BTreeMap<String, discovery::Unit>,
     ordered_ids: &[String],
-    extract_up: bool,
     copy_schema_objects: bool,
     hooks_config: &hooks::HooksConfig,
     root: &PathBuf,
@@ -286,7 +469,7 @@ async fn apply_and_compare(
         .await
         .context("Failed to connect to temporary database")?;
 
-    // Copy extensions from reference database to temp database
+    // Copy extensions from reference database
     let extensions: Vec<(String,)> = sqlx::query_as(
         "SELECT extname FROM pg_extension WHERE extname != 'plpgsql' ORDER BY extname"
     )
@@ -305,17 +488,16 @@ async fn apply_and_compare(
         }
     }
 
-    // Copy functions from reference DB if requested (for externally managed functions)
     if copy_schema_objects {
         println!("\nPre-copying functions from reference database...");
         copy_functions_from_ref(ref_url, temp_url).await?;
     }
 
-    // Run pre_apply hooks against the temporary database
+    // Run pre_apply hooks
     let root_abs = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     hooks::run_hooks(&hooks_config.pre_apply, "pre_apply", temp_url, &root_abs)?;
 
-    // Apply all migrations to temp database
+    // Apply all migrations
     println!("\nApplying {} migration(s) to temporary database...", ordered_ids.len());
 
     let mut ok_count = 0usize;
@@ -323,9 +505,9 @@ async fn apply_and_compare(
     let mut skip_count = 0usize;
     let mut failed_units: Vec<(String, String)> = Vec::new();
 
-    for (_i, unit_id) in ordered_ids.iter().enumerate() {
+    for unit_id in ordered_ids {
         let unit = &units[unit_id];
-        let sql = unit.read_sql_with_options(extract_up)?;
+        let sql = unit.read_sql()?;
 
         if sql.trim().is_empty() {
             skip_count += 1;
@@ -333,26 +515,20 @@ async fn apply_and_compare(
         }
 
         match execute_migration_sql(&temp_pool, &sql).await {
-            Ok(_) => {
-                ok_count += 1;
-            }
+            Ok(_) => ok_count += 1,
             Err(e) => {
                 fail_count += 1;
-                let err_msg = format!("{}", e);
-                failed_units.push((unit_id.clone(), err_msg));
+                failed_units.push((unit_id.clone(), format!("{}", e)));
             }
         }
-
     }
 
-    // Print progress as a single line
     print!("  Progress: {}/{}", ordered_ids.len(), ordered_ids.len());
     if fail_count > 0 {
         print!(" ({} failed)", fail_count);
     }
     println!();
 
-    // Show failed migrations
     if !failed_units.is_empty() {
         println!("\nFailed migrations:");
         for (unit_id, err) in &failed_units {
@@ -365,10 +541,10 @@ async fn apply_and_compare(
         ok_count, fail_count, skip_count
     );
 
-    // Run post_apply hooks against the temporary database
+    // Run post_apply hooks
     hooks::run_hooks(&hooks_config.post_apply, "post_apply", temp_url, &root_abs)?;
 
-    // Copy functions after migrations (they depend on types created by migrations)
+    // Copy functions after migrations if requested
     if copy_schema_objects {
         println!("\nCopying functions from reference database (post-migration)...");
         temp_pool.close().await;
@@ -385,20 +561,16 @@ async fn apply_and_compare(
         return Ok(());
     }
 
-    // Dump and compare schemas
+    // Compare schemas
     println!("\nComparing schemas...");
     let ref_schema = schema::dump_schema(ref_pool).await?;
     let temp_schema = schema::dump_schema(&temp_pool).await?;
     print_schema_comparison(&ref_schema, &temp_schema);
 
-    // Disconnect from temp DB before dropping
     temp_pool.close().await;
-
     Ok(())
 }
 
-/// Copy functions from reference DB (post-migration).
-/// Run after migrations so that types/domains exist for function signatures.
 async fn copy_functions_from_ref(ref_url: &str, temp_url: &str) -> Result<()> {
     let ref_pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
@@ -420,7 +592,6 @@ async fn copy_functions_from_ref(ref_url: &str, temp_url: &str) -> Result<()> {
     let mut func_count = 0;
     let mut func_errors = 0;
     for (def,) in &functions {
-        // Use CREATE OR REPLACE to handle functions already created by migrations
         let replace_def = def.replacen("CREATE FUNCTION", "CREATE OR REPLACE FUNCTION", 1);
         match sqlx::raw_sql(&replace_def).execute(&temp_pool).await {
             Ok(_) => func_count += 1,
@@ -431,121 +602,13 @@ async fn copy_functions_from_ref(ref_url: &str, temp_url: &str) -> Result<()> {
 
     ref_pool.close().await;
     temp_pool.close().await;
-
-    Ok(())
-}
-
-pub async fn convert(source: &PathBuf, output: &PathBuf) -> Result<()> {
-    use crate::migration_parser;
-
-    // Collect source SQL files
-    let mut sql_files: Vec<std::path::PathBuf> = Vec::new();
-    for entry in std::fs::read_dir(source)
-        .with_context(|| format!("Cannot read source directory: {}", source.display()))?
-    {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_file() && path.extension().map_or(false, |ext| ext == "sql") {
-            sql_files.push(path);
-        }
-    }
-    sql_files.sort();
-
-    if sql_files.is_empty() {
-        println!("No SQL files found in {}", source.display());
-        return Ok(());
-    }
-
-    println!("Found {} migration file(s)", sql_files.len());
-
-    // Create output directory
-    std::fs::create_dir_all(output)
-        .with_context(|| format!("Cannot create output directory: {}", output.display()))?;
-
-    let mut converted = 0;
-    let mut skipped = 0;
-
-    for file in &sql_files {
-        let filename = file.file_name().unwrap_or_default().to_string_lossy();
-        let raw = std::fs::read_to_string(file)
-            .with_context(|| format!("Failed to read {}", file.display()))?;
-
-        let up_sql = migration_parser::extract_up_section(&raw);
-
-        if up_sql.trim().is_empty() {
-            println!("  Skipping (empty Up section): {}", filename);
-            skipped += 1;
-            continue;
-        }
-
-        // Derive unit name from filename
-        // e.g., "20201101000001-initialize.sql" → "20201101000001-initialize"
-        let unit_name = filename
-            .strip_suffix(".sql")
-            .unwrap_or(&filename)
-            .to_string();
-
-        // Create unit directory
-        let unit_dir = output.join(&unit_name);
-        std::fs::create_dir_all(&unit_dir)
-            .with_context(|| format!("Cannot create unit directory: {}", unit_dir.display()))?;
-
-        // Write the Up SQL as 001.sql
-        let target_file = unit_dir.join("001.sql");
-        std::fs::write(&target_file, &up_sql)
-            .with_context(|| format!("Failed to write {}", target_file.display()))?;
-
-        converted += 1;
-    }
-
-    println!(
-        "\nConverted {} unit(s), skipped {} (output: {})",
-        converted,
-        skipped,
-        output.display()
-    );
-
-    // Generate lock file
-    println!("\nGenerating lock file...");
-    let units = discovery::discover(output)?;
-    let deps = planner::resolve_dependencies_with_options(&units, false)?;
-    planner::validate_no_cycles(&deps)?;
-    let order = planner::execution_order(&deps)?;
-
-    let lock = LockFile::from_units_with_options(&units, &deps, false)?;
-    lock.write(output)?;
-
-    println!("Lock file written with {} unit(s)", lock.units.len());
-
-    // Show execution plan summary
-    println!("\nExecution order ({} units):", order.len());
-    for (i, unit_id) in order.iter().enumerate() {
-        let dep = &deps[unit_id];
-        if dep.depends_on_units.is_empty() {
-            println!("  {}. {}", i + 1, unit_id);
-        } else {
-            println!(
-                "  {}. {} (depends on: {})",
-                i + 1,
-                unit_id,
-                dep.depends_on_units.join(", ")
-            );
-        }
-    }
-
     Ok(())
 }
 
 /// Execute migration SQL, handling ALTER TYPE ADD VALUE specially.
-///
-/// PostgreSQL's ALTER TYPE ADD VALUE cannot be used in the same transaction
-/// as statements that reference the new value. When this pattern is detected,
-/// we split the SQL into individual statements and execute each one separately
-/// (autocommit mode).
 async fn execute_migration_sql(pool: &sqlx::PgPool, sql: &str) -> Result<()> {
     let upper = sql.to_uppercase();
     if upper.contains("ADD VALUE") && upper.contains("ALTER TYPE") {
-        // Split into statements and execute individually
         for stmt in split_sql_statements(sql) {
             let trimmed = stmt.trim();
             if trimmed.is_empty() || trimmed == ";" {
@@ -569,8 +632,7 @@ async fn execute_migration_sql(pool: &sqlx::PgPool, sql: &str) -> Result<()> {
     }
 }
 
-/// Split SQL text into individual statements, respecting dollar-quoted strings
-/// and parenthesized expressions.
+/// Split SQL text into individual statements.
 pub fn split_sql_statements(sql: &str) -> Vec<String> {
     let mut statements = Vec::new();
     let mut current = String::new();
@@ -582,20 +644,16 @@ pub fn split_sql_statements(sql: &str) -> Vec<String> {
     while let Some(c) = chars.next() {
         current.push(c);
 
-        // Handle dollar-quoted strings: $$ ... $$ or $tag$ ... $tag$
         if c == '$' && paren_depth == 0 {
             if in_dollar_quote {
-                // Check if this closes the dollar quote
                 if current.ends_with(&dollar_tag) {
                     in_dollar_quote = false;
                     dollar_tag.clear();
                 }
             } else {
-                // Try to find opening dollar quote tag
                 let before = &current[..current.len() - 1];
                 if let Some(tag_start) = before.rfind('$') {
                     let tag = &before[tag_start..];
-                    // Validate tag (alphanumeric + underscore only between $...$)
                     let inner = &tag[1..];
                     if inner.is_empty() || inner.chars().all(|c| c.is_alphanumeric() || c == '_') {
                         in_dollar_quote = true;
@@ -609,9 +667,7 @@ pub fn split_sql_statements(sql: &str) -> Vec<String> {
             continue;
         }
 
-        // Handle single-line comments
         if c == '-' && chars.peek() == Some(&'-') {
-            // Consume until end of line
             current.push(chars.next().unwrap());
             while let Some(&nc) = chars.peek() {
                 if nc == '\n' {
@@ -652,7 +708,6 @@ fn print_schema_comparison(ref_schema: &schema::SchemaSnapshot, temp_schema: &sc
     diff.display();
 }
 
-/// Replace the database name in a PostgreSQL connection URL.
 fn replace_db_in_url(url: &str, new_db: &str) -> Result<String> {
     if let Some(pos) = url.rfind('/') {
         let base = &url[..pos];

@@ -30,40 +30,24 @@ pub enum DiscoveryMode {
 
 impl Unit {
     /// Read and concatenate all SQL content in order.
-    /// If `extract_up` is true, extract only the "Up" section from migration files.
-    pub fn read_sql_with_options(&self, extract_up: bool) -> Result<String> {
+    /// Automatically extracts "Up" section if migration markers are present.
+    pub fn read_sql(&self) -> Result<String> {
         let mut content = String::new();
         for file in &self.sql_files {
             let raw = std::fs::read_to_string(file)
                 .with_context(|| format!("Failed to read {}", file.display()))?;
-            if extract_up {
-                content.push_str(&migration_parser::extract_up_section(&raw));
-            } else {
-                content.push_str(&raw);
-            }
+            content.push_str(&migration_parser::extract_up_section(&raw));
             content.push('\n');
         }
         Ok(content)
     }
 
-    /// Read and concatenate all SQL content in order (no Up extraction).
-    #[allow(dead_code)]
-    pub fn read_sql(&self) -> Result<String> {
-        self.read_sql_with_options(false)
-    }
-
-    /// Compute a SHA-256 checksum of SQL content.
-    pub fn checksum_with_options(&self, extract_up: bool) -> Result<String> {
+    /// Compute a SHA-256 checksum of all SQL content.
+    pub fn checksum(&self) -> Result<String> {
         use sha2::{Digest, Sha256};
-        let content = self.read_sql_with_options(extract_up)?;
+        let content = self.read_sql()?;
         let hash = Sha256::digest(content.as_bytes());
         Ok(hex::encode(hash))
-    }
-
-    /// Compute a SHA-256 checksum of all SQL content.
-    #[allow(dead_code)]
-    pub fn checksum(&self) -> Result<String> {
-        self.checksum_with_options(false)
     }
 }
 
@@ -338,7 +322,7 @@ mod tests {
 
         let units = discover(dir.path()).unwrap();
         let unit = &units["001.sql"];
-        let sql = unit.read_sql_with_options(true).unwrap();
+        let sql = unit.read_sql().unwrap();
         assert!(sql.contains("CREATE TABLE"));
         assert!(!sql.contains("DROP TABLE"));
     }

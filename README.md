@@ -18,17 +18,11 @@ flugra replaces traditional migration systems with:
 # Build
 cargo build --release
 
-# Show execution plan
-flugra plan ./migrations
+# Show pending units and execution plan
+flugra plan --database-url postgres://user:pass@localhost/mydb ./migrations
 
-# Generate lock file
-flugra lock ./migrations
-
-# Apply to database
-flugra apply ./migrations --database-url postgres://user:pass@localhost/mydb
-
-# Check status
-flugra status --database-url postgres://user:pass@localhost/mydb
+# Apply pending units
+flugra apply --database-url postgres://user:pass@localhost/mydb ./migrations
 ```
 
 ## Concepts
@@ -54,6 +48,10 @@ migrations/
 - **Leaf directories** (containing `.sql` files with no child directories that also have `.sql` files) become units
 - **Flat directories** (a single directory with multiple `.sql` files) are auto-detected — each file becomes its own unit
 
+### Up/Down Section Handling
+
+Migration files with `-- +migrate Up` / `-- +migrate Down` or `-- Up Migration` / `-- Down Migration` markers are automatically handled — only the "Up" section is used. No flags needed.
+
 ### Dependency Resolution
 
 Dependencies are inferred by analyzing SQL:
@@ -72,25 +70,6 @@ Dependencies are inferred by analyzing SQL:
 2. Break ties with **lexical order** (deterministic)
 3. Validate: no circular dependencies
 
-### Lock File (`flugra.lock`)
-
-```yaml
-version: 1
-units:
-  users/create:
-    checksum: abc123...
-    depends_on: []
-  orders/add-user-ref:
-    checksum: def456...
-    depends_on:
-      - users/create
-      - orders/create
-```
-
-- Stores dependency graph as a **map** (not ordered list) — merge-friendly
-- Execution order is derived dynamically, not stored
-- Checksums ensure filesystem matches lock file
-
 ### Ledger Table
 
 Applied units are tracked in PostgreSQL:
@@ -105,58 +84,54 @@ CREATE TABLE schema_migrations (
 
 ## CLI Commands
 
-### `flugra plan [root]`
+### `flugra plan [root] --database-url <url>`
 
-Discover units, build dependency graph, and display execution order.
-
-```sh
-flugra plan ./migrations
-```
-
-### `flugra lock [root]`
-
-Generate or update `flugra.lock` with checksums and dependencies.
+Show pending units and execution plan. Connects to the database to check which units have already been applied.
 
 ```sh
-flugra lock ./migrations
+flugra plan --database-url postgres://localhost/mydb ./migrations
 ```
 
 ### `flugra apply [root] --database-url <url>`
 
-Validate lock file, then execute unapplied units in dependency order.
+Apply pending units in dependency order.
 
 ```sh
-flugra apply ./migrations --database-url postgres://localhost/mydb
+flugra apply --database-url postgres://localhost/mydb ./migrations
 ```
 
-### `flugra status --database-url <url>`
+### `flugra import [root] --database-url <url>`
 
-Show applied and pending units.
+Import existing migration state into flugra's ledger. Determines which units have already been applied by schema comparison — no dependency on the previous migration tool's tracking table.
+
+How it works:
+1. Snapshots the reference database schema
+2. Applies all migrations to a temporary database
+3. Compares the result with the reference schema
+4. Objects only in the migration result (not in reference DB) indicate pending migrations
+5. All units before the first pending unit are marked as applied
 
 ```sh
-flugra status --database-url postgres://localhost/mydb
+# Preview what would be imported
+flugra import --dry-run --database-url postgres://localhost/mydb ./migrations
+
+# Import (with confirmation prompt)
+flugra import --database-url postgres://localhost/mydb ./migrations
+
+# Import without confirmation
+flugra import -y --database-url postgres://localhost/mydb ./migrations
 ```
 
 ### `flugra diff [root] --database-url <url>`
 
-Compare a reference database schema against the result of applying migrations to a fresh temporary database.
+Verify migrations by applying them to a temporary database and comparing the resulting schema against the reference database.
 
 ```sh
-flugra diff ./migrations --database-url postgres://localhost/mydb
+flugra diff --database-url postgres://localhost/mydb ./migrations
 ```
 
 Options:
-- `--copy-schema-objects` — Copy functions/types from reference DB (for projects with externally managed functions)
-
-### `flugra convert <source> <output>`
-
-Convert existing flat migration files to flugra native directory-per-unit format.
-
-```sh
-flugra convert ./old-migrations ./flugra-migrations
-```
-
-This extracts "Up" sections, creates one directory per migration, and generates a lock file with inferred dependencies.
+- `--copy-schema-objects` — Copy functions from reference DB before applying (for projects with externally managed functions)
 
 ## Hooks
 
@@ -174,7 +149,7 @@ post_apply:
     description: "Run post-migration tasks"
 ```
 
-Hooks receive `DATABASE_URL` as an environment variable pointing to the target database. This works with both `apply` and `diff` commands — when using `diff`, hooks run against the temporary database.
+Hooks receive `DATABASE_URL` as an environment variable pointing to the target database. This works with `apply`, `import`, and `diff` — when using `diff` or `import`, hooks run against the temporary database.
 
 ### Use Case: Externally Managed Functions
 
@@ -184,19 +159,6 @@ For projects where plv8 or other functions are deployed outside of SQL migration
 pre_apply:
   - command: "psql \"$DATABASE_URL\" -f ./plv8-functions.sql -q"
     description: "Deploy plv8 functions before migrations"
-```
-
-## Global Options
-
-### `--extract-up`
-
-Extract only the "Up" section from migration files. Supports:
-- `-- +migrate Up` / `-- +migrate Down`
-- `-- Up Migration` / `-- Down Migration`
-
-```sh
-flugra --extract-up plan ./migrations
-flugra --extract-up diff --database-url postgres://localhost/mydb ./migrations
 ```
 
 ## Building
@@ -213,10 +175,9 @@ cargo test
 | `discovery` | Directory scanning, leaf unit detection, checksum computation |
 | `parser` | Lightweight SQL analysis (table creates/references) |
 | `planner` | Dependency graph, topological sort, cycle detection |
-| `lock` | `flugra.lock` generation, reading, validation |
 | `executor` | Unit execution within single transactions |
 | `ledger` | `schema_migrations` table management |
 | `hooks` | Lifecycle hooks (`pre_apply`, `post_apply`) |
-| `migration_parser` | Up/Down section extraction from existing migration files |
+| `migration_parser` | Up/Down section extraction from migration files |
 | `schema` | Database schema dumping and comparison |
 | `cli` | CLI command definitions and handlers |
