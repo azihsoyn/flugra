@@ -14,6 +14,12 @@ use cli::{Cli, Command};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Show banner when --help is requested
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() <= 1 || args.iter().any(|a| a == "--help" || a == "-h") {
+        eprint!("{}", cli::banner());
+    }
+
     let cli = Cli::parse();
 
     match cli.command {

@@ -4,6 +4,81 @@ use std::path::PathBuf;
 
 use crate::{discovery, executor, hooks, ledger, parser, planner, schema};
 
+pub fn banner() -> String {
+    // Plain text reference (each visible line = 65 chars):
+    //
+    //       ._________________________________________________________.
+    //      /  .~~. .~~~. .~~. .~~~. .~~. .~~~. .~~. .~~~. .~~. ~~.  /|
+    //     /  ~~~. .~~. .~~~. .~~. .~~~. .~~. .~~~. .~~. .~~~. ~~.  / |
+    //    +=========================================================+ |
+    //    |                                                         | |
+    //    |   ___ _                                                 | |
+    //    |  |  _| |  _   _   __ _  _ __  __ _                     | |
+    //    |  | |_| | | | | | / _` || '__|/ _` |  fluent migration  | |
+    //    |  |  _| | | |_| || (_| || |  | (_| |                    | |
+    //    |  |_| |_|  \__,_| \__, ||_|   \__,_|                    | |
+    //    |                   |___/                                 | |
+    //    |   +-------------------------------------------------+   | |
+    //    |   | CREATE TABLE  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ |   | |
+    //    |   | ALTER TABLE   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ |   |/
+    //    |   | INSERT INTO   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ |   /
+    //    |   +-------------------------------------------------+  /
+    //    +=========================================================+
+
+    // Cereal box style: tall and narrow
+    let y = "\x1b[33m"; let w = "\x1b[1;97m"; let c = "\x1b[36m";
+    let g = "\x1b[32m"; let d = "\x1b[2m";    let r = "\x1b[0m";
+
+    // Inner width = 34 (between the outer | |)
+    // Body: |@6..|@41, total visible = 42
+    fn visible_len(s: &str) -> usize {
+        let mut len = 0;
+        let mut in_esc = false;
+        for c in s.chars() {
+            if c == '\x1b' { in_esc = true; continue; }
+            if in_esc { if c.is_ascii_alphabetic() { in_esc = false; } continue; }
+            len += 1;
+        }
+        len
+    }
+    let bx = |inner: &str| -> String {
+        let vlen = visible_len(inner);
+        let pad = if 34 > vlen { 34 - vlen } else { 0 };
+        format!("      {y}|{r}{inner}{}{y}|{r}", " ".repeat(pad), y=y, r=r, inner=inner)
+    };
+
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(String::new());
+    // Seal (+@9..+@38)
+    lines.push(format!("         {d}+----------------------------+{r}"));
+    // Zipper (/@8..\@39)
+    lines.push(format!("        {d}/- - - - - - - - - - - - - - - \\{r}"));
+    // Taper (/@7..\@40)
+    lines.push(format!("       {d}/{r}                                {d}\\{r}"));
+    // Body (|@6..|@40, inner=33)
+    lines.push(bx(""));
+    lines.push(bx(&format!("    {w}___ _{r}")));
+    lines.push(bx(&format!("   {w}|  _| |_  _  __ _ _ __ __ _{r}")));
+    lines.push(bx(&format!("   {w}| |_| | || |/ _` | '__/ _` |{r}")));
+    lines.push(bx(&format!("   {w}|  _| | || | (_| | | | (_| |{r}")));
+    lines.push(bx(&format!("   {w}|_| |_|\\_,_|\\__, |_|  \\__,_|{r}")));
+    lines.push(bx(&format!("                {w}|___/{r}")));
+    lines.push(bx(&format!("       {c}~ fluent migration ~{r}")));
+    lines.push(bx(""));
+    lines.push(bx(&format!("  {d}+----------------------------+{r}")));
+    lines.push(bx(&format!("  {d}|{r} {g}CREATE TABLE ~~~~~~~~~~~~~{r} {d}|{r}")));
+    lines.push(bx(&format!("  {d}|{r} {g}ALTER TABLE  ~~~~~~~~~~~~~{r} {d}|{r}")));
+    lines.push(bx(&format!("  {d}|{r} {g}INSERT INTO  ~~~~~~~~~~~~~{r} {d}|{r}")));
+    lines.push(bx(&format!("  {d}|{r} {g}CREATE INDEX ~~~~~~~~~~~~~{r} {d}|{r}")));
+    lines.push(bx(&format!("  {d}+----------------------------+{r}")));
+    lines.push(bx(&format!("      {d}~ native SQL units ~{r}")));
+    // Bottom (+@6..+@41)
+    lines.push(format!("      {y}+==================================+{r}"));
+    lines.push(String::new());
+
+    lines.join("\n")
+}
+
 #[derive(Parser)]
 #[command(name = "flugra", about = "fluent migration — dependency-aware execution manager for native SQL units")]
 pub struct Cli {
