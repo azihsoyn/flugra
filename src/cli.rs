@@ -192,6 +192,42 @@ pub async fn import(root: &PathBuf, database_url: &str, dry_run: bool, yes: bool
         .await
         .context("Failed to connect to database")?;
 
+    // Early exit: check if there are any units not yet in the ledger
+    let table_exists: (bool,) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'schema_migrations')"
+    ).fetch_one(&ref_pool).await.unwrap_or((false,));
+
+    if table_exists.0 {
+        let existing_ids = ledger::applied_units(&ref_pool).await?;
+        let not_in_ledger: Vec<&String> = ordered_ids.iter()
+            .filter(|id| !existing_ids.contains(*id))
+            .collect();
+
+        if not_in_ledger.is_empty() {
+            println!("\nNothing to import. All {} unit(s) are already in the ledger.", ordered_ids.len());
+            return Ok(());
+        }
+
+        // Quick check: if all non-ledger units create tables that don't exist
+        // in the reference DB, they're clearly pending — no need for temp DB.
+        let ref_schema = schema::dump_schema(&ref_pool).await?;
+        let all_pending = not_in_ledger.iter().all(|id| {
+            let unit = &units[*id];
+            let sql = unit.read_sql().unwrap_or_default();
+            let analysis = crate::parser::analyze(&sql);
+            // If it creates new tables not in ref DB, it's pending
+            // If it creates nothing (ALTER/DML only), we can't tell — need full check
+            !analysis.creates.is_empty() && analysis.creates.iter().all(|t| !ref_schema.tables.contains_key(t))
+        });
+
+        if all_pending {
+            println!("\nNothing to import. {} unit(s) in ledger, {} pending.", existing_ids.len(), not_in_ledger.len());
+            return Ok(());
+        }
+
+        println!("{} unit(s) in ledger, {} not yet in ledger. Running full detection...", existing_ids.len(), not_in_ledger.len());
+    }
+
     println!("Snapshotting reference database schema...");
     let ref_schema = schema::dump_schema(&ref_pool).await?;
 
@@ -251,20 +287,40 @@ async fn import_detect_applied(
 
     println!("\nApplying all migrations to temporary database...");
 
-    let mut apply_results: Vec<(String, bool)> = Vec::new();
+    let mut ddl_failed: Vec<(String, String)> = Vec::new();
+    let mut dml_warned: Vec<(String, String)> = Vec::new();
+    let mut ok_count = 0usize;
     for unit_id in ordered_ids {
         let unit = &units[unit_id];
         let sql = unit.read_sql()?;
         if sql.trim().is_empty() {
-            apply_results.push((unit_id.clone(), true));
+            ok_count += 1;
             continue;
         }
-        let ok = execute_migration_sql(&temp_pool, &sql).await.is_ok();
-        apply_results.push((unit_id.clone(), ok));
+        let result = execute_migration_sql_lenient(&temp_pool, &sql).await;
+        if result.has_ddl_errors() {
+            ddl_failed.push((unit_id.clone(), result.ddl_errors.join("; ")));
+        } else {
+            ok_count += 1;
+        }
+        if result.has_dml_warnings() {
+            dml_warned.push((unit_id.clone(), result.dml_warnings.join("; ")));
+        }
     }
-    let ok_count = apply_results.iter().filter(|(_, ok)| *ok).count();
-    let fail_count = apply_results.iter().filter(|(_, ok)| !*ok).count();
-    println!("  Applied: {}, Failed: {}", ok_count, fail_count);
+    println!("  Applied: {}, Failed: {}, DML warnings: {}", ok_count, ddl_failed.len(), dml_warned.len());
+
+    if !ddl_failed.is_empty() {
+        println!("\n  Failed migrations (DDL errors):");
+        for (unit_id, err) in &ddl_failed {
+            println!("    {} -- {}", unit_id, err);
+        }
+    }
+    if !dml_warned.is_empty() {
+        println!("\n  DML warnings (expected on empty DB):");
+        for (unit_id, err) in &dml_warned {
+            println!("    {} -- {}", unit_id, err);
+        }
+    }
 
     // Compare final temp schema with reference
     let temp_schema = schema::dump_schema(&temp_pool).await?;
@@ -329,27 +385,29 @@ async fn import_detect_applied(
         .filter(|(id, _)| !existing_ids.contains(id))
         .collect();
 
-    // Show schema_migrations table state
+    // Nothing to import — early return
+    if new_records.is_empty() {
+        println!();
+        println!("Nothing to import. All {} applied unit(s) are already in the ledger.", existing_ids.len());
+        if !pending_ids.is_empty() {
+            println!("{} unit(s) are pending (not yet applied to reference DB).", pending_ids.len());
+        }
+        temp_pool.close().await;
+        return Ok(());
+    }
+
+    // Show what will happen
     println!();
     if !table_exists.0 {
         println!("Table 'schema_migrations' does not exist and will be created.");
     } else if !existing_ids.is_empty() {
         println!("Table 'schema_migrations' already exists with {} record(s).", existing_ids.len());
     }
-    println!("{} record(s) will be inserted into schema_migrations.", new_records.len());
-    if !new_records.is_empty() && !existing_ids.is_empty() {
-        let overlap = to_import.len() - new_records.len();
-        if overlap > 0 {
-            println!("{} record(s) already exist and will be skipped.", overlap);
-        }
-    }
 
-    // Show unit list
-    let label = if dry_run { "[DRY RUN] Would import" } else { "Will import" };
-    println!("\n{} {} unit(s) as applied:\n", label, to_import.len());
-    for (id, checksum) in &to_import {
-        let marker = if existing_ids.contains(id) { " (already in ledger)" } else { "" };
-        println!("  {} (checksum: {}...){}", id, &checksum[..8.min(checksum.len())], marker);
+    let label = if dry_run { "[DRY RUN] Would insert" } else { "Will insert" };
+    println!("\n{} {} record(s) into schema_migrations:\n", label, new_records.len());
+    for (id, checksum) in &new_records {
+        println!("  {} (checksum: {}...)", id, &checksum[..8.min(checksum.len())]);
     }
 
     if !pending_ids.is_empty() {
@@ -360,8 +418,8 @@ async fn import_detect_applied(
     }
 
     println!("\nSummary:");
-    println!("  Applied:    {}", applied_ids.len());
     println!("  To insert:  {}", new_records.len());
+    println!("  Already in ledger: {}", existing_ids.len());
     println!("  Pending:    {}", pending_ids.len());
     println!("  Total:      {}", ordered_ids.len());
 
@@ -384,26 +442,15 @@ async fn import_detect_applied(
         }
     }
 
-    println!("\nImporting {} unit(s) into schema_migrations...\n", to_import.len());
+    println!("\nImporting {} record(s) into schema_migrations...\n", new_records.len());
 
     ledger::ensure_table(ref_pool).await?;
-    let already = ledger::applied_units(ref_pool).await?;
-    let mut imported = 0;
-    let mut skipped = 0;
 
-    for (id, checksum) in &to_import {
-        if already.contains(id) {
-            skipped += 1;
-            continue;
-        }
+    for (id, checksum) in &new_records {
         ledger::record(ref_pool, id, checksum).await?;
-        imported += 1;
     }
 
-    println!(
-        "Done. Imported: {}, Already in ledger: {}, Pending: {}",
-        imported, skipped, pending_ids.len()
-    );
+    println!("Done. Imported: {} record(s).", new_records.len());
 
     temp_pool.close().await;
     Ok(())
@@ -501,9 +548,9 @@ async fn apply_and_compare(
     println!("\nApplying {} migration(s) to temporary database...", ordered_ids.len());
 
     let mut ok_count = 0usize;
-    let mut fail_count = 0usize;
     let mut skip_count = 0usize;
-    let mut failed_units: Vec<(String, String)> = Vec::new();
+    let mut ddl_failed: Vec<(String, String)> = Vec::new();
+    let mut dml_warned: Vec<(String, String)> = Vec::new();
 
     for unit_id in ordered_ids {
         let unit = &units[unit_id];
@@ -514,31 +561,39 @@ async fn apply_and_compare(
             continue;
         }
 
-        match execute_migration_sql(&temp_pool, &sql).await {
-            Ok(_) => ok_count += 1,
-            Err(e) => {
-                fail_count += 1;
-                failed_units.push((unit_id.clone(), format!("{}", e)));
-            }
+        let result = execute_migration_sql_lenient(&temp_pool, &sql).await;
+        if result.has_ddl_errors() {
+            ddl_failed.push((unit_id.clone(), result.ddl_errors.join("; ")));
+        } else {
+            ok_count += 1;
+        }
+        if result.has_dml_warnings() {
+            dml_warned.push((unit_id.clone(), result.dml_warnings.join("; ")));
         }
     }
 
     print!("  Progress: {}/{}", ordered_ids.len(), ordered_ids.len());
-    if fail_count > 0 {
-        print!(" ({} failed)", fail_count);
+    if !ddl_failed.is_empty() {
+        print!(" ({} failed)", ddl_failed.len());
     }
     println!();
 
-    if !failed_units.is_empty() {
-        println!("\nFailed migrations:");
-        for (unit_id, err) in &failed_units {
+    if !ddl_failed.is_empty() {
+        println!("\nFailed migrations (DDL errors):");
+        for (unit_id, err) in &ddl_failed {
+            println!("  {} -- {}", unit_id, err);
+        }
+    }
+    if !dml_warned.is_empty() {
+        println!("\nDML warnings (expected on empty DB):");
+        for (unit_id, err) in &dml_warned {
             println!("  {} -- {}", unit_id, err);
         }
     }
 
     println!(
-        "\nMigration summary: {} OK, {} failed, {} skipped",
-        ok_count, fail_count, skip_count
+        "\nMigration summary: {} OK, {} DDL failed, {} DML warnings, {} skipped",
+        ok_count, ddl_failed.len(), dml_warned.len(), skip_count
     );
 
     // Run post_apply hooks
@@ -605,31 +660,66 @@ async fn copy_functions_from_ref(ref_url: &str, temp_url: &str) -> Result<()> {
     Ok(())
 }
 
-/// Execute migration SQL, handling ALTER TYPE ADD VALUE specially.
-async fn execute_migration_sql(pool: &sqlx::PgPool, sql: &str) -> Result<()> {
-    let upper = sql.to_uppercase();
-    if upper.contains("ADD VALUE") && upper.contains("ALTER TYPE") {
-        for stmt in split_sql_statements(sql) {
-            let trimmed = stmt.trim();
-            if trimmed.is_empty() || trimmed == ";" {
-                continue;
-            }
-            sqlx::raw_sql(trimmed)
-                .execute(pool)
-                .await
-                .with_context(|| {
-                    let preview: String = trimmed.chars().take(80).collect();
-                    format!("Failed at: {}...", preview)
-                })?;
+/// Execute migration SQL for schema verification (import/diff).
+/// Splits into statements and executes each individually.
+/// DML errors (INSERT, UPDATE, DELETE, TRUNCATE) are treated as warnings
+/// since the temp DB has no data. DDL errors are still reported as failures.
+async fn execute_migration_sql_lenient(pool: &sqlx::PgPool, sql: &str) -> LenientResult {
+    let mut ddl_errors: Vec<String> = Vec::new();
+    let mut dml_warnings: Vec<String> = Vec::new();
+
+    for stmt in split_sql_statements(sql) {
+        let trimmed = stmt.trim();
+        if trimmed.is_empty() || trimmed == ";" {
+            continue;
         }
-        Ok(())
-    } else {
-        sqlx::raw_sql(sql)
-            .execute(pool)
-            .await
-            .map(|_| ())
-            .map_err(|e| anyhow::anyhow!("{}", e))
+
+        if let Err(e) = sqlx::raw_sql(trimmed).execute(pool).await {
+            if is_dml_statement(trimmed) {
+                dml_warnings.push(format!("{}", e));
+            } else {
+                ddl_errors.push(format!("{}", e));
+            }
+        }
     }
+
+    LenientResult { ddl_errors, dml_warnings }
+}
+
+struct LenientResult {
+    ddl_errors: Vec<String>,
+    dml_warnings: Vec<String>,
+}
+
+impl LenientResult {
+    fn has_ddl_errors(&self) -> bool {
+        !self.ddl_errors.is_empty()
+    }
+
+    fn has_dml_warnings(&self) -> bool {
+        !self.dml_warnings.is_empty()
+    }
+}
+
+/// Check if a SQL statement is DML (data manipulation) rather than DDL (schema change).
+fn is_dml_statement(sql: &str) -> bool {
+    // Skip leading comments and whitespace to find the first keyword
+    let stripped = sql.lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.starts_with("--") && !l.is_empty())
+        .next()
+        .unwrap_or("")
+        .to_uppercase();
+
+    // Also handle SET LOCAL which is session-level, not schema
+    stripped.starts_with("INSERT ")
+        || stripped.starts_with("UPDATE ")
+        || stripped.starts_with("DELETE ")
+        || stripped.starts_with("TRUNCATE ")
+        || stripped.starts_with("COPY ")
+        || stripped.starts_with("SET ")
+        || stripped.starts_with("SELECT ")
+        || stripped.starts_with("WITH ")  // CTE, usually data query
 }
 
 /// Split SQL text into individual statements.
